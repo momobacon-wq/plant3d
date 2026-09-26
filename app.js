@@ -5,7 +5,7 @@ import { MeshoptDecoder } from './vendor/meshopt_decoder.mjs';
 const $ = id => document.getElementById(id);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
 const TRI_BUDGET = IS_MOBILE ? 6e6 : 20e6;     // triangles kept on the GPU at once
-const MAX_PARALLEL = 3;
+const MAX_FINE = 6, MAX_COARSE = 16;   // concurrent fine downloads / coarse decodes
 const HILITE = [255, 60, 30, 255];
 const REMEMBER_KEY = 'nwv.pass';
 
@@ -16,10 +16,20 @@ async function deriveKey(pass, manifest) {
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: manifest.iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
 }
-async function fetchSealed(url) {
+async function fetchBytes(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-  const buf = new Uint8Array(await res.arrayBuffer());
+  return new Uint8Array(await res.arrayBuffer());
+}
+async function fetchSealed(url) { return openSealed(await fetchBytes(url)); }
+// coarse tiles are packed into a few bundle files; each slice is sealed on its own
+const bundleCache = new Map();
+function bundle(i) {
+  let p = bundleCache.get(i);
+  if (!p) { p = fetchBytes(`data/tiles/${index.coarseBundles[i]}`); p.catch(() => bundleCache.delete(i)); bundleCache.set(i, p); }
+  return p;
+}
+async function openSealed(buf) {
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.subarray(0, 12) }, aesKey, buf.subarray(12));
   const ds = new Blob([plain]).stream().pipeThrough(new DecompressionStream('gzip'));
   return new Uint8Array(await new Response(ds).arrayBuffer());
@@ -92,7 +102,8 @@ const namedById = new Map();
 // Each tile has a coarse layer (always loaded, small) and a fine layer (loaded by priority within
 // TRI_BUDGET). While the fine layer is on screen the coarse one is hidden.
 const tiles = [];          // {meta, box, L:{c:Layer, f:Layer}};  Layer = {state, group, batches, tris}
-let loadedTris = 0, inflight = 0;
+let loadedTris = 0, inflight = 0, inflightC = 0;
+const hasCoarse = t => !!(t.meta.c || t.meta.cl);
 let hilite = null;         // {a, b} item id range
 
 // NWT2 tile -> baked meshes (one per opaque / transparent batch), positions quantised to the tile box.
@@ -185,9 +196,11 @@ function layerTris(t, lod) { return lod === 'f' ? t.meta.t : t.meta.ct; }
 
 async function loadLayer(t, lod) {
   const L = t.L[lod];
-  L.state = 'loading'; inflight++;
+  L.state = 'loading'; if (lod === 'f') inflight++; else inflightC++;
   try {
-    const bytes = await fetchSealed(lod === 'f' ? `${t.meta.u || 'data/tiles/'}${t.meta.f}` : `data/tiles/${t.meta.c}`);
+    const bytes = lod === 'f' ? await fetchSealed(`${t.meta.u || 'data/tiles/'}${t.meta.f}`)
+      : t.meta.cl ? await openSealed((await bundle(t.meta.cb)).subarray(t.meta.co, t.meta.co + t.meta.cl))
+      : await fetchSealed(`data/tiles/${t.meta.c}`);
     if (L.state !== 'loading') return;             // cancelled meanwhile
     L.batches = parseTile(bytes, t.box);
     L.group = new THREE.Group();
@@ -200,7 +213,8 @@ async function loadLayer(t, lod) {
   } catch (e) {
     console.error(e); L.state = 'error';
   } finally {
-    inflight--; dirty = true; updateStatus(); queueMicrotask(schedule);
+    if (lod === 'f') inflight--; else inflightC--;
+    dirty = true; updateStatus(); queueMicrotask(schedule);
   }
 }
 
@@ -234,7 +248,7 @@ function schedule() {
   }
   const order = tiles.slice().sort((a, b) => a.prio - b.prio);
   let budget = 0;
-  for (const t of tiles) if (t.meta.c) budget += t.meta.ct;
+  for (const t of tiles) if (hasCoarse(t)) budget += t.meta.ct;
   const keep = new Set();
   for (const t of order) {
     if (t.prio === Infinity) break;
@@ -243,11 +257,11 @@ function schedule() {
   }
   for (const t of tiles) if (t.L.f.state !== 'idle' && t.L.f.state !== 'error' && !keep.has(t)) unloadLayer(t, 'f');
   for (const t of order) {                       // coarse first, nearest first
-    if (inflight >= MAX_PARALLEL) break;
-    if (t.meta.c && t.L.c.state === 'idle') loadLayer(t, 'c');
+    if (inflightC >= MAX_COARSE) break;
+    if (hasCoarse(t) && t.L.c.state === 'idle') loadLayer(t, 'c');
   }
   for (const t of order) {
-    if (inflight >= MAX_PARALLEL) break;
+    if (inflight >= MAX_FINE) break;
     if (keep.has(t) && t.L.f.state === 'idle') loadLayer(t, 'f');
   }
   updateStatus();
@@ -255,8 +269,8 @@ function schedule() {
 
 function updateStatus() {
   const f = tiles.filter(t => t.L.f.state === 'ready').length;
-  const c = tiles.filter(t => t.L.c.state === 'ready').length, cn = tiles.filter(t => t.meta.c).length;
-  $('status').textContent = `${c < cn ? `概覽 ${c}/${cn} · ` : ''}精細 ${f}/${tiles.length} 區 · ${(loadedTris / 1e6).toFixed(1)}M 面${inflight ? ' · 載入中' : ''}`;
+  const c = tiles.filter(t => t.L.c.state === 'ready').length, cn = tiles.filter(hasCoarse).length;
+  $('status').textContent = `${c < cn ? `概覽 ${c}/${cn} · ` : ''}精細 ${f}/${tiles.length} 區 · ${(loadedTris / 1e6).toFixed(1)}M 面${inflight || inflightC ? ' · 載入中' : ''}`;
 }
 
 
