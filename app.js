@@ -16,10 +16,20 @@ async function deriveKey(pass, manifest) {
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: manifest.iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
 }
-async function fetchBytes(url) {
+// Data files are served through jsDelivr (pinned to a commit, fast edge cache in Taiwan); fall back
+// to the GitHub Pages copy if the CDN fails.
+let urlMap = {};
+async function fetchOnce(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
   return new Uint8Array(await res.arrayBuffer());
+}
+async function fetchBytes(url) {
+  for (const p in urlMap) if (url.startsWith(p)) {
+    try { return await fetchOnce(urlMap[p] + url.slice(p.length)); } catch (e) { console.warn('CDN failed, falling back', e); }
+    break;
+  }
+  return fetchOnce(url);
 }
 async function fetchSealed(url) { return openSealed(await fetchBytes(url)); }
 // coarse tiles are packed into a few bundle files; each slice is sealed on its own
@@ -546,6 +556,7 @@ async function unlock(pass, remember) {
   $('lockMsg').className = ''; $('lockMsg').textContent = '驗證中…'; $('unlockBtn').disabled = true;
   try {
     const manifest = await (await fetch('data/manifest.json', { cache: 'no-store' })).json();
+    urlMap = manifest.map || {};
     aesKey = await deriveKey(pass, manifest);
     let bytes;
     try { bytes = await fetchSealed('data/index.bin'); }
