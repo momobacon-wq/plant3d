@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="data:,">
+<title>3D 模型檢視</title>
+<style>
+  :root {
+    --bg: #1b1f24; --panel: rgba(28, 32, 38, 0.94); --line: #3a414b; --text: #e8eaed; --dim: #9aa3ad;
+    --accent: #ff9a1f; --btn: #2c333c; --btn-on: #ff9a1f; --btn-on-text: #1b1f24; --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); overflow: hidden;
+    font: 15px/1.4 -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  button { font: inherit; color: var(--text); background: var(--btn); border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 12px; min-height: 40px; cursor: pointer; }
+  button.on { background: var(--btn-on); color: var(--btn-on-text); border-color: var(--btn-on); }
+  input { font: inherit; color: var(--text); background: #11151a; border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; min-height: 42px; width: 100%; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+  /* lock screen */
+  #lock { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--bg); z-index: 20; }
+  #lock form { width: 100%; max-width: 360px; display: grid; gap: 12px; }
+  #lock h1 { font-size: 20px; margin: 0 0 4px; }
+  #lock label.row { display: flex; gap: 8px; align-items: center; color: var(--dim); font-size: 14px; }
+  #lock label.row input { width: auto; min-height: 0; }
+  #lockMsg { min-height: 1.4em; color: var(--dim); font-size: 14px; }
+  #lockMsg.err { color: var(--danger); }
+
+  /* top bar */
+  #top { position: fixed; top: calc(env(safe-area-inset-top) + 8px); left: 8px; right: 8px; display: flex; gap: 8px; z-index: 5; pointer-events: none; }
+  #top > * { pointer-events: auto; }
+  #searchBox { flex: 1; max-width: 520px; position: relative; }
+  #results { position: absolute; top: 48px; left: 0; right: 0; max-height: min(60vh, 460px); overflow-y: auto; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; display: none; -webkit-overflow-scrolling: touch; }
+  #results.show { display: block; }
+  #results .r { padding: 9px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  #results .r:last-child { border-bottom: 0; }
+  #results .r:active, #results .r.sel { background: #343c46; }
+  #results .n { word-break: break-all; }
+  #results .s { color: var(--dim); font-size: 12px; word-break: break-all; }
+  #results .more { padding: 8px 12px; color: var(--dim); font-size: 13px; }
+
+  /* bottom tools */
+  #tools { position: fixed; bottom: calc(env(safe-area-inset-bottom) + 8px); left: 8px; right: 8px; display: flex; gap: 8px; flex-wrap: wrap; z-index: 5; pointer-events: none; }
+  #tools > * { pointer-events: auto; }
+  #status { position: fixed; right: 8px; top: calc(env(safe-area-inset-top) + 58px); font-size: 12px; color: var(--dim); background: var(--panel);
+    border-radius: 8px; padding: 4px 8px; z-index: 4; pointer-events: none; }
+
+  /* info panel */
+  #info { position: fixed; left: 8px; bottom: calc(env(safe-area-inset-bottom) + 60px); width: min(420px, calc(100vw - 16px)); max-height: min(45vh, 420px); overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; z-index: 5; display: none; }
+  #info.show { display: block; }
+  #info h2 { font-size: 16px; margin: 0 28px 6px 0; word-break: break-all; color: var(--accent); }
+  #info .close { position: absolute; top: 6px; right: 6px; min-height: 32px; padding: 2px 10px; }
+  #info table { border-collapse: collapse; width: 100%; font-size: 13px; table-layout: fixed; }
+  #info td { border-top: 1px solid var(--line); padding: 4px 4px; vertical-align: top; word-break: break-all; }
+  #info td:first-child { color: var(--dim); width: 34%; }
+  #info .path span { cursor: pointer; text-decoration: underline; text-decoration-color: var(--line); }
+  #info .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+
+  @media (max-width: 700px) { #info { max-height: 36vh; padding: 10px; } #info h2 { font-size: 15px; } #tools button { padding: 6px 10px; } }
+  #marker { position: fixed; left: 0; top: 0; width: 44px; height: 44px; border: 3px solid #ff5a1e; border-radius: 50%; box-shadow: 0 0 0 3px rgba(255,255,255,0.8), 0 0 12px rgba(255,90,30,0.9); pointer-events: none; z-index: 3; display: none; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 6px rgba(255,255,255,0.5), 0 0 20px rgba(255,90,30,1); } }
+  #loading { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; z-index: 10; pointer-events: none; }
+  #loading.show { display: flex; }
+  #loading div { background: var(--panel); padding: 10px 16px; border-radius: 10px; }
+</style>
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js" } }</script>
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="lock">
+  <form id="lockForm" autocomplete="off">
+    <h1>3D 模型檢視</h1>
+    <input id="pass" type="password" placeholder="請輸入密鑰" autocomplete="current-password" required>
+    <label class="row"><input id="remember" type="checkbox"> 在這台裝置記住密鑰</label>
+    <button type="submit" id="unlockBtn">開啟</button>
+    <div id="lockMsg"></div>
+  </form>
+</div>
+
+<div id="top">
+  <div id="searchBox">
+    <input id="q" type="search" placeholder="搜尋位號" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="search">
+    <div id="results"></div>
+  </div>
+</div>
+<div id="status"></div>
+<div id="marker"></div>
+
+<div id="info">
+  <button class="close" id="infoClose" aria-label="關閉">✕</button>
+  <h2 id="infoTitle"></h2>
+  <div id="infoBody"></div>
+</div>
+
+<div id="tools">
+  <button id="btnHome">全景</button>
+  <button id="btnSection">剖面盒</button>
+  <button id="btnXray">透視</button>
+  <button id="btnClear">清除標示</button>
+</div>
+
+<div id="loading"><div id="loadingText">載入中…</div></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
