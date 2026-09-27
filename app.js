@@ -3,7 +3,22 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 
 const $ = id => document.getElementById(id);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
-const TRI_BUDGET = IS_MOBILE ? 6e6 : 20e6;     // triangles kept on the GPU at once
+// Triangles kept on the GPU at once. 高畫質 doubles it; if the tab dies while it is on (iOS kills a
+// page that runs out of memory and reloads it) the next load falls back to the standard budget.
+const HQ_KEY = 'nwv.hq', HQ_RUN = 'nwv.hqrun';
+let hq = false, hqCrashed = false;
+try {
+  hq = localStorage.getItem(HQ_KEY) === '1';
+  if (hq && sessionStorage.getItem(HQ_RUN)) { hq = false; hqCrashed = true; localStorage.removeItem(HQ_KEY); }
+} catch { }
+const triBudget = () => (IS_MOBILE ? 6e6 : 20e6) * (hq ? 2 : 1);
+function markHqRun(on = hq && document.visibilityState === 'visible') {
+  try { if (on) sessionStorage.setItem(HQ_RUN, '1'); else sessionStorage.removeItem(HQ_RUN); } catch { }
+}
+markHqRun();
+// a page evicted while in the background, reloaded or closed is not a crash
+addEventListener('pagehide', () => markHqRun(false));
+document.addEventListener('visibilitychange', () => markHqRun());
 const MAX_FINE = 6, MAX_COARSE = 16;   // concurrent fine downloads / coarse decodes
 const HILITE = [255, 60, 30, 255];
 const REMEMBER_KEY = 'nwv.pass';
@@ -123,7 +138,7 @@ let index = null;          // decrypted index.json
 let named = [];            // [id, end, name, cls, parentNamedId, x0,y0,z0,x1,y1,z1, props]
 const namedById = new Map();
 // Each tile has a coarse layer (always loaded, small) and a fine layer (loaded by priority within
-// TRI_BUDGET). While the fine layer is on screen the coarse one is hidden.
+// triBudget()). While the fine layer is on screen the coarse one is hidden.
 const tiles = [];          // {meta, box, L:{c:Layer, f:Layer}};  Layer = {state, group, batches, tris}
 let loadedTris = 0, inflight = 0, inflightC = 0;
 const hasCoarse = t => !!(t.meta.c || t.meta.cl);
@@ -265,7 +280,7 @@ function* readyLayers() {
 
 // Coarse layers first (whole plant silhouette), then fine layers nearest to the orbit target.
 const _v = new THREE.Vector3(), _frustum = new THREE.Frustum(), _pm = new THREE.Matrix4();
-let wantSchedule = true;
+let wantSchedule = true, budgetFull = false;
 function schedule() {
   wantSchedule = false;
   camera.updateMatrixWorld();
@@ -273,18 +288,22 @@ function schedule() {
   const focus = controls.target;
   const viewDist = camera.position.distanceTo(focus);
   for (const t of tiles) {
-    const d = t.box.distanceToPoint(focus);
     const inView = _frustum.intersectsBox(t.box);
+    // tile boxes overlap a lot (long pipe runs stretch them), so a big box is pushed back by a share of
+    // its size: its triangles are spread out and few of them are near
+    t.sz ??= Math.max(t.meta.b[3] - t.meta.b[0], t.meta.b[4] - t.meta.b[1], t.meta.b[5] - t.meta.b[2]);
+    const d = (inView ? Math.min(t.box.distanceToPoint(focus), t.box.distanceToPoint(camera.position)) : t.box.distanceToPoint(focus)) + t.sz * 0.3;
     const inSection = !sectionOn || !sectionBox || sectionBox.intersectsBox(t.box);
     t.prio = inSection ? (inView ? 1 : 3) * (d + viewDist * 0.05 + 1) : Infinity;
   }
   const order = tiles.slice().sort((a, b) => a.prio - b.prio);
   let budget = 0;
   for (const t of tiles) if (hasCoarse(t)) budget += t.meta.ct;
-  const keep = new Set();
+  const keep = new Set(), limit = triBudget();
+  budgetFull = false;
   for (const t of order) {
     if (t.prio === Infinity) break;
-    if (budget + t.meta.t > TRI_BUDGET) break;
+    if (budget + t.meta.t > limit) { budgetFull = true; break; }
     budget += t.meta.t; keep.add(t);
   }
   for (const t of tiles) if (t.L.f.state !== 'idle' && t.L.f.state !== 'error' && !keep.has(t)) unloadLayer(t, 'f');
@@ -303,7 +322,7 @@ function schedule() {
 function updateStatus() {
   const f = tiles.filter(t => t.L.f.state === 'ready').length;
   const c = tiles.filter(t => t.L.c.state === 'ready').length, cn = tiles.filter(hasCoarse).length;
-  $('status').textContent = `${c < cn ? `概覽 ${c}/${cn} · ` : ''}精細 ${f}/${tiles.length} 區 · ${(loadedTris / 1e6).toFixed(1)}M 面${inflight || inflightC ? ' · 載入中' : ''}`;
+  $('status').textContent = `${c < cn ? `概覽 ${c}/${cn} · ` : ''}精細 ${f}/${tiles.length} 區 · ${(loadedTris / 1e6).toFixed(1)}M 面${inflight || inflightC ? ' · 載入中' : budgetFull ? '（上限）' : ''}`;
 }
 
 
@@ -651,6 +670,12 @@ $('minimap').addEventListener('pointerup', e => {
   anim = { t0: performance.now(), dur: 600, p0: camera.position.clone(), q0: controls.target.clone(), p1: camera.position.clone().add(q1.clone().sub(controls.target)), q1 };
   wantSchedule = true;
 });
+$('btnHQ').classList.toggle('on', hq);
+$('btnHQ').onclick = () => {
+  hq = !hq; markHqRun();
+  try { if (hq) localStorage.setItem(HQ_KEY, '1'); else localStorage.removeItem(HQ_KEY); } catch { }
+  $('btnHQ').classList.toggle('on', hq); wantSchedule = true;
+};
 $('btnVols').onclick = () => { showVols = !showVols; refreshHidden(); };
 $('btnUnhide').onclick = () => { userHidden = []; refreshHidden(); };
 $('btnMap').onclick = () => {
@@ -721,6 +746,7 @@ function start() {
   wantSchedule = true;
   refreshHidden();
   requestAnimationFrame(frame);
+  if (hqCrashed) setTimeout(() => alert('上次開「高畫質」時頁面記憶體不足被重新載入，已自動切回標準畫質。'), 300);
 }
 
 $('lockForm').addEventListener('submit', e => { e.preventDefault(); unlock($('pass').value, $('remember').checked); });
