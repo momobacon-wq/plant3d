@@ -77,7 +77,19 @@ function resize() {
 addEventListener('resize', resize);
 
 let dirty = true;
-controls.addEventListener('change', () => { dirty = true; wantSchedule = true; });
+// Orbit zoom only shrinks the distance to the pivot, so it stalls as it gets close. When the user
+// zooms in that far, push the pivot ahead along the view direction so zooming keeps flying forward.
+const PUSH_MIN = 1.5;          // metres
+let lastDist = null;
+controls.addEventListener('change', () => {
+  const d = camera.position.distanceTo(controls.target);
+  if (lastDist !== null && d < lastDist - 1e-6 && d < PUSH_MIN && !anim) {
+    const dir = controls.target.clone().sub(camera.position).normalize();
+    controls.target.addScaledVector(dir, PUSH_MIN * 2 - d);
+  }
+  lastDist = camera.position.distanceTo(controls.target);
+  dirty = true; wantSchedule = true;
+});
 
 // clipping (section box)
 const clipPlanes = [];
@@ -570,7 +582,7 @@ async function unlock(pass, remember) {
   } finally { $('unlockBtn').disabled = false; }
 }
 
-window.__nwv = { tiles, get named() { return named; }, get hilite() { return hilite; } };
+window.__nwv = { camera, controls, tiles, get named() { return named; }, get hilite() { return hilite; } };
 function start() {
   $('lock').style.display = 'none';
   document.title = index.doc.replace(/\.nwd$/i, '');
