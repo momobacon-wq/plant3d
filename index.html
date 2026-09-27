@@ -63,7 +63,12 @@
   #info .path span { cursor: pointer; text-decoration: underline; text-decoration-color: var(--line); }
   #info .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 
-  @media (max-width: 700px) { #info { max-height: 36vh; padding: 10px; } #info h2 { font-size: 15px; } #tools button { padding: 6px 10px; } }
+  @media (max-width: 700px) { #info { max-height: 36vh; padding: 10px; } #info h2 { font-size: 15px; } #tools button { padding: 6px 10px; }
+    /* one row that scrolls sideways instead of wrapping over the info panel */
+    #tools { flex-wrap: nowrap; overflow-x: auto; pointer-events: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+    #tools::-webkit-scrollbar { display: none; }
+    #tools button { flex: none; }
+    #info .actions { gap: 6px; } #info .actions button { padding: 6px 9px; } }
   #marker { position: fixed; left: 0; top: 0; width: 44px; height: 44px; border: 3px solid #ff5a1e; border-radius: 50%; box-shadow: 0 0 0 3px rgba(255,255,255,0.8), 0 0 12px rgba(255,90,30,0.9); pointer-events: none; z-index: 3; display: none; animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 50% { box-shadow: 0 0 0 6px rgba(255,255,255,0.5), 0 0 20px rgba(255,90,30,1); } }
   #markerLabel { position: absolute; top: 48px; left: 50%; transform: translateX(-50%); white-space: nowrap; font-size: 12px; font-weight: 600;
@@ -113,6 +118,8 @@
   <button id="btnXray">透視</button>
   <button id="btnClear">清除標示</button>
   <button id="btnMap" class="on">地圖</button>
+  <button id="btnVols">紅色空間</button>
+  <button id="btnUnhide" style="display:none">顯示已隱藏</button>
 </div>
 
 <div id="loading"><div id="loadingText">載入中…</div></div>

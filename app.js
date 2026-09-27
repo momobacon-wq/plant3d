@@ -7,6 +7,7 @@ const TRI_BUDGET = IS_MOBILE ? 6e6 : 20e6;     // triangles kept on the GPU at o
 const MAX_FINE = 6, MAX_COARSE = 16;   // concurrent fine downloads / coarse decodes
 const HILITE = [255, 60, 30, 255];
 const REMEMBER_KEY = 'nwv.pass';
+const HIDE_KEY = 'nwv.hidden';
 
 // ---------------- crypto ----------------
 let aesKey = null;
@@ -164,7 +165,61 @@ function batchMesh(bt) {
   const mesh = new THREE.Mesh(g, bt.transparent ? matTrans : matOpaque);
   mesh.position.set(bt.tmin[0], bt.tmin[1], bt.tmin[2]); mesh.scale.set(bt.sc[0], bt.sc[1], bt.sc[2]);
   mesh.matrixAutoUpdate = false; mesh.updateMatrix();
-  return { mesh, ranges: bt.ranges, col: bt.col, orig: null };
+  const b = { mesh, ranges: bt.ranges, col: bt.col, orig: null, full: null };
+  applyHide(b);
+  return b;
+}
+
+// ---------------- hiding ----------------
+// Item-id ranges that are not drawn: the GE / HST maintenance and clearance volumes (hidden.bin, the
+// solid red "space reservation" boxes, shown again with 紅色空間) plus items hidden from the info panel.
+// A batch keeps one index buffer: visible triangles are packed to the front and the draw range cut,
+// so raycasting and the GPU both skip the hidden ones.
+let volRanges = [], showVols = false, userHidden = [], hideList = [];
+try { userHidden = JSON.parse(localStorage.getItem(HIDE_KEY) || '[]'); } catch { }
+function rebuildHideList() {
+  const all = (showVols ? [] : volRanges).concat(userHidden).map(r => r.slice()).sort((p, q) => p[0] - q[0]);
+  const out = [];
+  for (const [a, b] of all) {
+    if (out.length && a <= out[out.length - 1] + 1) out[out.length - 1] = Math.max(out[out.length - 1], b);
+    else out.push(a, b);
+  }
+  hideList = out;
+}
+function isHidden(id) {
+  let lo = 0, hi = hideList.length / 2 - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (hideList[m * 2 + 1] < id) lo = m + 1; else if (hideList[m * 2] > id) hi = m - 1; else return true;
+  }
+  return false;
+}
+function applyHide(b) {
+  const g = b.mesh.geometry, attr = g.index, r = b.ranges;
+  let mask = null;
+  if (hideList.length) for (let i = 0; i < r.length; i += 3) if (isHidden(r[i])) {
+    if (!mask) mask = new Uint8Array(g.getAttribute('position').count);
+    mask.fill(1, r[i + 1], r[i + 1] + r[i + 2]);
+  }
+  if (!mask) {
+    if (b.full) { attr.array.set(b.full); attr.needsUpdate = true; b.full = null; g.setDrawRange(0, Infinity); }
+    return;
+  }
+  if (!b.full) b.full = attr.array.slice();
+  const f = b.full, idx = attr.array;
+  let n = 0;
+  for (let t = 0; t < f.length; t += 3) if (!mask[f[t]]) { idx[n++] = f[t]; idx[n++] = f[t + 1]; idx[n++] = f[t + 2]; }
+  attr.needsUpdate = true; g.setDrawRange(0, n);
+}
+function refreshHidden() {
+  rebuildHideList();
+  for (const t of tiles) for (const lod of ['c', 'f']) if (t.L[lod].state === 'ready') for (const b of t.L[lod].batches) applyHide(b);
+  if (hilite) { const m = markerAt, h = hilite; highlight(h.a, h.b); markerAt = m; }
+  $('btnVols').classList.toggle('on', showVols);
+  $('btnUnhide').style.display = userHidden.length ? '' : 'none';
+  $('btnUnhide').textContent = `顯示已隱藏 (${userHidden.length})`;
+  try { localStorage.setItem(HIDE_KEY, JSON.stringify(userHidden)); } catch { }
+  dirty = true;
 }
 
 function layerTris(t, lod) { return lod === 'f' ? t.meta.t : t.meta.ct; }
@@ -269,8 +324,8 @@ function applyHilite(L, h) {
     }
     if (!vr.length) continue;
     attr.needsUpdate = true;
-    const idx = b.mesh.geometry.index.array, sel = [];
-    for (let t = 0; t < idx.length; t += 3) {
+    const idx = b.mesh.geometry.index.array, sel = [], nIdx = Math.min(idx.length, b.mesh.geometry.drawRange.count);
+    for (let t = 0; t < nIdx; t += 3) {
       const v = idx[t];
       for (let j = 0; j < vr.length; j += 2) if (v >= vr[j] && v < vr[j + 1]) { sel.push(idx[t], idx[t + 1], idx[t + 2]); break; }
     }
@@ -369,6 +424,12 @@ function rowBox(r) { return new THREE.Box3(new THREE.Vector3(r[5], r[6], r[7]), 
 
 let markerAt = null, markerName = '';
 function selectNamed(r, fly = true) {
+  if (isHidden(r[0]) || isHidden(r[1])) {
+    userHidden = userHidden.filter(([a, b]) => b < r[0] || a > r[1]);
+    rebuildHideList();
+    if (isHidden(r[0]) || isHidden(r[1])) showVols = true;
+    refreshHidden();
+  }
   highlight(r[0], r[1]);
   markerAt = rowBox(r).getCenter(new THREE.Vector3()); markerName = r[2];
   const box = rowBox(r);
@@ -402,11 +463,15 @@ function showInfo(r) {
     ['尺寸', `${sz.x.toFixed(2)} × ${sz.y.toFixed(2)} × ${sz.z.toFixed(2)} ${index.units === 'Meters' ? 'm' : index.units}`],
     ['中心', `E ${(c.x + o[0]).toFixed(2)}　N ${(c.y + o[1]).toFixed(2)}　EL ${(c.z + o[2]).toFixed(2)}`],
   ];
-  $('infoBody').innerHTML = `<div class="actions"><button id="infoWhere">看在全廠哪裡</button><button id="infoFly">移到這裡</button><button id="infoSect">剖面盒框住</button></div>
+  $('infoBody').innerHTML = `<div class="actions"><button id="infoWhere">看在全廠哪裡</button><button id="infoFly">移到這裡</button><button id="infoSect">剖面盒框住</button><button id="infoHide">隱藏</button></div>
     <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}<tbody id="propRows"></tbody></table>`;
   $('infoWhere').onclick = () => { sectionOn = false; setSection(null); flyToBox(mainBox(), 1.0); wantSchedule = true; };
   $('infoFly').onclick = () => { const b = rowBox(r), sec = b.clone().expandByScalar(Math.max(b.getSize(_v).length() * 0.5, 3)); sectionOn = true; setSection(sec); flyToBox(b, 1.6, sec.getSize(_v).length() * 0.6); wantSchedule = true; };
   $('infoSect').onclick = () => { sectionOn = true; setSection(rowBox(r).expandByScalar(Math.max(rowBox(r).getSize(_v).length() * 0.3, 3))); flyToBox(rowBox(r)); wantSchedule = true; };
+  $('infoHide').onclick = () => {
+    userHidden.push([r[0], r[1]]); clearHilite(); refreshHidden();
+    $('info').classList.remove('show'); updateViewOffset();
+  };
   $('infoBody').querySelectorAll('.path span[data-id]').forEach(el => el.onclick = () => { const x = namedById.get(+el.dataset.id); if (x) selectNamed(x); });
   $('info').classList.add('show');
   updateViewOffset();
@@ -585,6 +650,8 @@ $('minimap').addEventListener('pointerup', e => {
   anim = { t0: performance.now(), dur: 600, p0: camera.position.clone(), q0: controls.target.clone(), p1: camera.position.clone().add(q1.clone().sub(controls.target)), q1 };
   wantSchedule = true;
 });
+$('btnVols').onclick = () => { showVols = !showVols; refreshHidden(); };
+$('btnUnhide').onclick = () => { userHidden = []; refreshHidden(); };
 $('btnMap').onclick = () => {
   const cv = $('minimap'); cv.classList.toggle('off');
   $('btnMap').classList.toggle('on', !cv.classList.contains('off')); dirty = true;
@@ -620,9 +687,11 @@ async function unlock(pass, remember) {
     urlMap = manifest.map || {};
     aesKey = await deriveKey(pass, manifest);
     let bytes;
+    const vols = fetchSealed('hidden.bin').then(b => JSON.parse(new TextDecoder().decode(b))).catch(e => { console.warn('no hidden.bin', e); return []; });
     try { bytes = await fetchSealed('data/index.bin'); }
     catch (e) { if (e.name === 'OperationError') throw new Error('密鑰錯誤'); throw e; }
     index = JSON.parse(new TextDecoder().decode(bytes));
+    volRanges = await vols; rebuildHideList();
     startWorkers();
     try { if (remember) localStorage.setItem(REMEMBER_KEY, pass); else localStorage.removeItem(REMEMBER_KEY); } catch { }
     start();
@@ -649,6 +718,7 @@ function start() {
   setNearFar(camera.position.distanceTo(c));
   controls.update();
   wantSchedule = true;
+  refreshHidden();
   requestAnimationFrame(frame);
 }
 
