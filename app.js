@@ -172,7 +172,8 @@ function batchMesh(bt) {
 
 // ---------------- hiding ----------------
 // Item-id ranges that are not drawn: the GE / HST maintenance and clearance volumes (hidden.bin, the
-// solid red "space reservation" boxes, shown again with 紅色空間) plus items hidden from the info panel.
+// solid red "space reservation" boxes, and the /HAZZ hazardous-area zones around gas vents; shown again
+// with 保留空間) plus items hidden from the info panel.
 // A batch keeps one index buffer: visible triangles are packed to the front and the draw range cut,
 // so raycasting and the GPU both skip the hidden ones.
 let volRanges = [], showVols = false, userHidden = [], hideList = [];
