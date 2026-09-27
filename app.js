@@ -412,10 +412,10 @@ function runSearch(q) {
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function rowBox(r) { return new THREE.Box3(new THREE.Vector3(r[5], r[6], r[7]), new THREE.Vector3(r[8], r[9], r[10])); }
 
-let markerAt = null;
+let markerAt = null, markerName = '';
 function selectNamed(r, fly = true) {
   highlight(r[0], r[1]);
-  markerAt = rowBox(r).getCenter(new THREE.Vector3());
+  markerAt = rowBox(r).getCenter(new THREE.Vector3()); markerName = r[2];
   const box = rowBox(r);
   if (fly) sectionOn = true;
   const sec = box.clone().expandByScalar(Math.max(box.getSize(_v).length() * 0.5, 3));
@@ -447,9 +447,10 @@ function showInfo(r) {
     ['尺寸', `${sz.x.toFixed(2)} × ${sz.y.toFixed(2)} × ${sz.z.toFixed(2)} ${index.units === 'Meters' ? 'm' : index.units}`],
     ['中心', `E ${(c.x + o[0]).toFixed(2)}　N ${(c.y + o[1]).toFixed(2)}　EL ${(c.z + o[2]).toFixed(2)}`],
   ];
-  $('infoBody').innerHTML = `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}<tbody id="propRows"></tbody></table>
-    <div class="actions"><button id="infoFly">移到這裡</button><button id="infoSect">剖面盒框住</button></div>`;
-  $('infoFly').onclick = () => flyToBox(rowBox(r));
+  $('infoBody').innerHTML = `<div class="actions"><button id="infoWhere">看在全廠哪裡</button><button id="infoFly">移到這裡</button><button id="infoSect">剖面盒框住</button></div>
+    <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}<tbody id="propRows"></tbody></table>`;
+  $('infoWhere').onclick = () => { sectionOn = false; setSection(null); flyToBox(mainBox(), 1.0); wantSchedule = true; };
+  $('infoFly').onclick = () => { const b = rowBox(r), sec = b.clone().expandByScalar(Math.max(b.getSize(_v).length() * 0.5, 3)); sectionOn = true; setSection(sec); flyToBox(b, 1.6, sec.getSize(_v).length() * 0.6); wantSchedule = true; };
   $('infoSect').onclick = () => { sectionOn = true; setSection(rowBox(r).expandByScalar(Math.max(rowBox(r).getSize(_v).length() * 0.3, 3))); flyToBox(rowBox(r)); wantSchedule = true; };
   $('infoBody').querySelectorAll('.path span[data-id]').forEach(el => el.onclick = () => { const x = namedById.get(+el.dataset.id); if (x) selectNamed(x); });
   $('info').classList.add('show');
@@ -543,7 +544,72 @@ function placeMarker() {
   if (p.z > 1 || p.z < -1) { m.style.display = 'none'; return; }
   m.style.display = 'block';
   m.style.transform = `translate(${(p.x + 1) / 2 * innerWidth - 22}px, ${(1 - p.y) / 2 * innerHeight - 22}px)`;
+  $('markerLabel').textContent = markerName;
 }
+// ---------------- minimap ----------------
+// A top-down picture of the plant rendered once (after the coarse layer is in), with the selected
+// item and the current camera drawn on top. Tapping it moves the view there.
+const mm = { img: null, box: null, ready: false };
+function buildMinimap() {
+  if (mm.ready) return;
+  const box = mainBox(), c = box.getCenter(new THREE.Vector3());
+  const s = Math.max(box.max.x - box.min.x, box.max.y - box.min.y) * 0.75;
+  mm.box = { x0: c.x - s, x1: c.x + s, y0: c.y - s, y1: c.y + s };
+  const N = 512;
+  const cam = new THREE.OrthographicCamera(-s, s, s, -s, 1, 6000);
+  cam.up.set(0, 1, 0); cam.position.set(c.x, c.y, c.z + 3000); cam.lookAt(c.x, c.y, c.z);
+  const rt = new THREE.WebGLRenderTarget(N, N); rt.texture.colorSpace = THREE.SRGBColorSpace;
+  const clip = renderer.localClippingEnabled, wasX = xray;
+  renderer.localClippingEnabled = false; if (wasX) setXray(false);
+  const hidden = [];
+  for (const t of tiles) for (const b of (t.L.f.batches || []).concat(t.L.c.batches || [])) if (b.overlay) { b.overlay.visible = false; hidden.push(b.overlay); }
+  renderer.setRenderTarget(rt); renderer.render(scene, cam); renderer.setRenderTarget(null);
+  renderer.localClippingEnabled = clip; if (wasX) setXray(true); for (const o of hidden) o.visible = true;
+  const px = new Uint8Array(N * N * 4); renderer.readRenderTargetPixels(rt, 0, 0, N, N, px); rt.dispose();
+  const off = document.createElement('canvas'); off.width = off.height = N;
+  const ctx = off.getContext('2d'), img = ctx.createImageData(N, N);
+  for (let y = 0; y < N; y++) img.data.set(px.subarray((N - 1 - y) * N * 4, (N - y) * N * 4), y * N * 4);
+  ctx.putImageData(img, 0, 0);
+  mm.img = off; mm.ready = true; dirty = true;
+}
+function mmToPx(x, y, W, H) { return [(x - mm.box.x0) / (mm.box.x1 - mm.box.x0) * W, (1 - (y - mm.box.y0) / (mm.box.y1 - mm.box.y0)) * H]; }
+function drawMinimap() {
+  const cv = $('minimap');
+  if (!mm.ready || cv.classList.contains('off')) return;
+  const dpr = Math.min(devicePixelRatio, 2), W = Math.round(cv.clientWidth * dpr), H = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(mm.img, 0, 0, W, H);
+  const clampP = ([x, y]) => [Math.min(Math.max(x, 6 * dpr), W - 6 * dpr), Math.min(Math.max(y, 6 * dpr), H - 6 * dpr)];
+  // camera: position dot + viewing wedge
+  const [cx, cy] = clampP(mmToPx(camera.position.x, camera.position.y, W, H));
+  const d = controls.target.clone().sub(camera.position);
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(Math.atan2(-d.y, d.x));
+  ctx.fillStyle = 'rgba(40,120,255,0.35)'; ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, 26 * dpr, -0.45, 0.45); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#2878ff'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2 * dpr;
+  ctx.beginPath(); ctx.arc(0, 0, 5 * dpr, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore();
+  if (markerAt) {
+    const [mx, my] = clampP(mmToPx(markerAt.x, markerAt.y, W, H));
+    const pulse = 6 + 3 * Math.sin(performance.now() / 200);
+    ctx.fillStyle = '#ff3b1e'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5 * dpr;
+    ctx.beginPath(); ctx.arc(mx, my, pulse * dpr, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+}
+$('minimap').addEventListener('pointerup', e => {
+  if (!mm.ready) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  const x = mm.box.x0 + (e.clientX - r.left) / r.width * (mm.box.x1 - mm.box.x0);
+  const y = mm.box.y1 - (e.clientY - r.top) / r.height * (mm.box.y1 - mm.box.y0);
+  const q1 = new THREE.Vector3(x, y, controls.target.z);
+  if (sectionOn && sectionBox && !sectionBox.containsPoint(q1)) { sectionOn = false; setSection(null); }
+  anim = { t0: performance.now(), dur: 600, p0: camera.position.clone(), q0: controls.target.clone(), p1: camera.position.clone().add(q1.clone().sub(controls.target)), q1 };
+  wantSchedule = true;
+});
+$('btnMap').onclick = () => {
+  const cv = $('minimap'); cv.classList.toggle('off');
+  $('btnMap').classList.toggle('on', !cv.classList.contains('off')); dirty = true;
+};
+
 // ---------------- loop ----------------
 let lastSchedule = 0;
 function frame(now) {
@@ -555,11 +621,14 @@ function frame(now) {
     dirty = true; wantSchedule = true;
   }
   if (controls.update()) dirty = true;
+  if (markerAt && mm.ready && now - (frame.lastPulse || 0) > 50) { frame.lastPulse = now; drawMinimap(); }
+  if (!mm.ready && tiles.length && tiles.every(t => !hasCoarse(t) || t.L.c.state === 'ready' || t.L.c.state === 'error')) buildMinimap();
   if (wantSchedule && now - lastSchedule > 300) { lastSchedule = now; schedule(); }
   if (dirty) {
     setNearFar(camera.position.distanceTo(controls.target));
     renderer.render(scene, camera); dirty = false;
     placeMarker();
+    drawMinimap();
   }
 }
 

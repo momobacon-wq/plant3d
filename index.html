@@ -35,7 +35,7 @@
   #top { position: fixed; top: calc(env(safe-area-inset-top) + 8px); left: 8px; right: 8px; display: flex; gap: 8px; z-index: 5; pointer-events: none; }
   #top > * { pointer-events: auto; }
   #searchBox { flex: 1; max-width: 520px; position: relative; }
-  #results { position: absolute; top: 48px; left: 0; right: 0; max-height: min(60vh, 460px); overflow-y: auto; background: var(--panel);
+  #results { z-index: 6; position: absolute; top: 48px; left: 0; right: 0; max-height: min(60vh, 460px); overflow-y: auto; background: var(--panel);
     border: 1px solid var(--line); border-radius: 10px; display: none; -webkit-overflow-scrolling: touch; }
   #results.show { display: block; }
   #results .r { padding: 9px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
@@ -66,6 +66,12 @@
   @media (max-width: 700px) { #info { max-height: 36vh; padding: 10px; } #info h2 { font-size: 15px; } #tools button { padding: 6px 10px; } }
   #marker { position: fixed; left: 0; top: 0; width: 44px; height: 44px; border: 3px solid #ff5a1e; border-radius: 50%; box-shadow: 0 0 0 3px rgba(255,255,255,0.8), 0 0 12px rgba(255,90,30,0.9); pointer-events: none; z-index: 3; display: none; animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 50% { box-shadow: 0 0 0 6px rgba(255,255,255,0.5), 0 0 20px rgba(255,90,30,1); } }
+  #markerLabel { position: absolute; top: 48px; left: 50%; transform: translateX(-50%); white-space: nowrap; font-size: 12px; font-weight: 600;
+    color: #fff; background: rgba(255,90,30,0.92); padding: 2px 8px; border-radius: 6px; max-width: 60vw; overflow: hidden; text-overflow: ellipsis; }
+  #minimap { position: fixed; left: 8px; top: calc(env(safe-area-inset-top) + 58px); width: 180px; height: 180px; border-radius: 10px;
+    border: 1px solid var(--line); background: #cfd6de; box-shadow: 0 2px 8px rgba(0,0,0,0.25); z-index: 4; touch-action: none; cursor: crosshair; }
+  #minimap.off { display: none; }
+  @media (max-width: 700px) { #minimap { width: 120px; height: 120px; } }
   #loading { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; z-index: 10; pointer-events: none; }
   #loading.show { display: flex; }
   #loading div { background: var(--panel); padding: 10px 16px; border-radius: 10px; }
@@ -92,7 +98,8 @@
   </div>
 </div>
 <div id="status"></div>
-<div id="marker"></div>
+<div id="marker"><div id="markerLabel"></div></div>
+<canvas id="minimap" aria-label="全廠小地圖"></canvas>
 
 <div id="info">
   <button class="close" id="infoClose" aria-label="關閉">✕</button>
@@ -105,6 +112,7 @@
   <button id="btnSection">剖面盒</button>
   <button id="btnXray">透視</button>
   <button id="btnClear">清除標示</button>
+  <button id="btnMap" class="on">地圖</button>
 </div>
 
 <div id="loading"><div id="loadingText">載入中…</div></div>
