@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
-import { MeshoptDecoder } from './vendor/meshopt_decoder.mjs';
 
 const $ = id => document.getElementById(id);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
@@ -32,13 +31,6 @@ async function fetchBytes(url) {
   return fetchOnce(url);
 }
 async function fetchSealed(url) { return openSealed(await fetchBytes(url)); }
-// coarse tiles are packed into a few bundle files; each slice is sealed on its own
-const bundleCache = new Map();
-function bundle(i) {
-  let p = bundleCache.get(i);
-  if (!p) { p = fetchBytes(`data/tiles/${index.coarseBundles[i]}`); p.catch(() => bundleCache.delete(i)); bundleCache.set(i, p); }
-  return p;
-}
 async function openSealed(buf) {
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.subarray(0, 12) }, aesKey, buf.subarray(12));
   const ds = new Blob([plain]).stream().pipeThrough(new DecompressionStream('gzip'));
@@ -48,7 +40,8 @@ async function openSealed(buf) {
 // ---------------- scene ----------------
 const canvas = $('view');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: !IS_MOBILE, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, IS_MOBILE ? 2 : 1.5));
+const BASE_DPR = Math.min(devicePixelRatio, IS_MOBILE ? 2 : 1.5);
+renderer.setPixelRatio(BASE_DPR);
 renderer.localClippingEnabled = true;
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xb9c4cf);
@@ -81,6 +74,13 @@ let dirty = true;
 // zooms in that far, push the pivot ahead along the view direction so zooming keeps flying forward.
 const PUSH_MIN = 1.5;          // metres
 let lastDist = null;
+let interacting = false, idleTimer = 0;
+function setDpr(r) { if (renderer.getPixelRatio() !== r) { renderer.setPixelRatio(r); renderer.setSize(innerWidth, innerHeight, false); dirty = true; } }
+controls.addEventListener('start', () => { interacting = true; clearTimeout(idleTimer); if (IS_MOBILE) setDpr(1); });
+controls.addEventListener('end', () => {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { interacting = false; setDpr(BASE_DPR); wantSchedule = true; }, 400);
+});
 controls.addEventListener('change', () => {
   const d = camera.position.distanceTo(controls.target);
   if (lastDist !== null && d < lastDist - 1e-6 && d < PUSH_MIN && !anim) {
@@ -128,90 +128,43 @@ let loadedTris = 0, inflight = 0, inflightC = 0;
 const hasCoarse = t => !!(t.meta.c || t.meta.cl);
 let hilite = null;         // {a, b} item id range
 
-// NWT2 tile -> baked meshes (one per opaque / transparent batch), positions quantised to the tile box.
-function parseTile(bytes, box) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (dv.getUint32(0, true) !== 0x3254574e) throw new Error('bad tile');
-  const jl = dv.getUint32(4, true);
-  const head = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + jl)));
-  const p4 = n => (n + 3) & ~3;
-  let o = 8 + p4(jl);
-  const instOff = o; o += head.nInst * 56;
-  // decode unique meshes into local float positions + unit normals
-  const meshes = head.meshes.map(([nv, ni, vbl, ibl, mx, my, mz, ex, ey, ez]) => {
-    const vb = new Uint8Array(nv * 8);
-    MeshoptDecoder.decodeVertexBuffer(vb, nv, 8, bytes.subarray(o, o + vbl)); o += p4(vbl);
-    const ib = new Uint8Array(ni * 4);
-    MeshoptDecoder.decodeIndexBuffer(ib, ni, 4, bytes.subarray(o, o + ibl)); o += p4(ibl);
-    const q = new Uint16Array(vb.buffer), s8 = new Int8Array(vb.buffer);
-    const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3);
-    for (let v = 0; v < nv; v++) {
-      pos[v * 3] = mx + q[v * 4] / 65535 * ex; pos[v * 3 + 1] = my + q[v * 4 + 1] / 65535 * ey; pos[v * 3 + 2] = mz + q[v * 4 + 2] / 65535 * ez;
-      let x = s8[v * 8 + 6] / 127, y = s8[v * 8 + 7] / 127, z = 1 - Math.abs(x) - Math.abs(y);
-      if (z < 0) { const px = x; x = (1 - Math.abs(y)) * (px >= 0 ? 1 : -1); y = (1 - Math.abs(px)) * (y >= 0 ? 1 : -1); }
-      const l = Math.hypot(x, y, z) || 1; nrm[v * 3] = x / l; nrm[v * 3 + 1] = y / l; nrm[v * 3 + 2] = z / l;
-    }
-    return { nv, ni, pos, nrm, idx: new Uint32Array(ib.buffer) };
-  });
-  // two passes over the instances: count, then bake
-  const items = head.items;
-  const batchOf = li => (items[li][4] < 250 ? 1 : 0);
-  const cnt = [{ v: 0, i: 0 }, { v: 0, i: 0 }];
-  for (let k = 0; k < head.nInst; k++) {
-    const li = dv.getInt32(instOff + k * 56, true), ml = dv.getInt32(instOff + k * 56 + 4, true);
-    const b = cnt[batchOf(li)]; b.v += meshes[ml].nv; b.i += meshes[ml].ni;
+// Tiles are fetched, decrypted and baked in a small worker pool (tileworker.js); the main thread
+// only wraps the returned arrays in meshes.
+const workers = [];
+let workerSeq = 0;
+const pending = new Map();
+function startWorkers() {
+  const n = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+  for (let i = 0; i < n; i++) {
+    const w = new Worker('./tileworker.js', { type: 'module' });
+    w.busy = 0;
+    w.onmessage = ({ data }) => {
+      const p = pending.get(data.id); if (!p) return;
+      pending.delete(data.id); w.busy--;
+      if (data.error) p.reject(new Error(data.error)); else p.resolve(data.batches);
+    };
+    w.postMessage({ type: 'init', key: aesKey, urlMap });
+    workers.push(w);
   }
-  const tmin = [box.min.x, box.min.y, box.min.z];
-  const sc = [0, 1, 2].map(a => Math.max([box.max.x, box.max.y, box.max.z][a] - tmin[a], 1e-3) / 65535);
-  const out = [];
-  const B = cnt.map(c => c.v ? { pos: new Uint16Array(c.v * 3 + (c.v * 3) % 2), nrm: new Int8Array(c.v * 4), col: new Uint8Array(c.v * 4), idx: new Uint32Array(c.i), nv: 0, ni: 0, ranges: [], lastItem: -1 } : null);
-  for (let k = 0; k < head.nInst; k++) {
-    const io = instOff + k * 56;
-    const li = dv.getInt32(io, true), ml = dv.getInt32(io + 4, true);
-    const m = new Float32Array(12);
-    for (let j = 0; j < 12; j++) m[j] = dv.getFloat32(io + 8 + j * 4, true);
-    const mesh = meshes[ml], bt = B[batchOf(li)], it = items[li];
-    if (bt.lastItem !== li) { bt.ranges.push(it[0], bt.nv, 0); bt.lastItem = li; }
-    const v0 = bt.nv;
-    const det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
-    for (let v = 0; v < mesh.nv; v++) {
-      const x = mesh.pos[v * 3], y = mesh.pos[v * 3 + 1], z = mesh.pos[v * 3 + 2];
-      const w0 = x * m[0] + y * m[3] + z * m[6] + m[9], w1 = x * m[1] + y * m[4] + z * m[7] + m[10], w2 = x * m[2] + y * m[5] + z * m[8] + m[11];
-      const d = (bt.nv + v) * 3;
-      bt.pos[d] = Math.min(65535, Math.max(0, Math.round((w0 - tmin[0]) / sc[0])));
-      bt.pos[d + 1] = Math.min(65535, Math.max(0, Math.round((w1 - tmin[1]) / sc[1])));
-      bt.pos[d + 2] = Math.min(65535, Math.max(0, Math.round((w2 - tmin[2]) / sc[2])));
-      const nx = mesh.nrm[v * 3], ny = mesh.nrm[v * 3 + 1], nz = mesh.nrm[v * 3 + 2];
-      // world normal, then pre-multiplied by the quantisation scale (cancels the mesh scale in the normal matrix)
-      let a = (nx * m[0] + ny * m[3] + nz * m[6]) * sc[0], b = (nx * m[1] + ny * m[4] + nz * m[7]) * sc[1], c = (nx * m[2] + ny * m[5] + nz * m[8]) * sc[2];
-      const l = Math.hypot(a, b, c) || 1;
-      const n4 = (bt.nv + v) * 4;
-      bt.nrm[n4] = Math.round(a / l * 127); bt.nrm[n4 + 1] = Math.round(b / l * 127); bt.nrm[n4 + 2] = Math.round(c / l * 127);
-      bt.col[n4] = it[1]; bt.col[n4 + 1] = it[2]; bt.col[n4 + 2] = it[3]; bt.col[n4 + 3] = it[4];
-    }
-    for (let i = 0; i < mesh.ni; i += 3) {
-      const a = mesh.idx[i] + v0, b = mesh.idx[i + 1] + v0, c = mesh.idx[i + 2] + v0;
-      if (det < 0) { bt.idx[bt.ni++] = a; bt.idx[bt.ni++] = c; bt.idx[bt.ni++] = b; }
-      else { bt.idx[bt.ni++] = a; bt.idx[bt.ni++] = b; bt.idx[bt.ni++] = c; }
-    }
-    bt.nv += mesh.nv;
-    bt.ranges[bt.ranges.length - 1] += mesh.nv;
-  }
-  for (let bi = 0; bi < 2; bi++) {
-    const bt = B[bi]; if (!bt) continue;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(bt.pos.subarray(0, bt.nv * 3), 3));
-    g.setAttribute('normal', new THREE.InterleavedBufferAttribute(new THREE.InterleavedBuffer(bt.nrm, 4), 3, 0, true));
-    g.setAttribute('color', new THREE.BufferAttribute(bt.col, 4, true));
-    g.setIndex(new THREE.BufferAttribute(bt.idx, 1));
-    g.boundingBox = new THREE.Box3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(65535, 65535, 65535));
-    g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
-    const mesh = new THREE.Mesh(g, bi ? matTrans : matOpaque);
-    mesh.position.set(tmin[0], tmin[1], tmin[2]); mesh.scale.set(sc[0], sc[1], sc[2]);
-    mesh.matrixAutoUpdate = false; mesh.updateMatrix();
-    out.push({ mesh, ranges: Int32Array.from(bt.ranges), col: bt.col, orig: null });
-  }
-  return out;
+}
+function workerCall(msg) {
+  const w = workers.reduce((p, q) => (q.busy < p.busy ? q : p));
+  const id = ++workerSeq;
+  w.busy++;
+  return new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); w.postMessage({ ...msg, id }); });
+}
+function batchMesh(bt) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(bt.pos, 3));
+  g.setAttribute('normal', new THREE.InterleavedBufferAttribute(new THREE.InterleavedBuffer(bt.nrm, 4), 3, 0, true));
+  g.setAttribute('color', new THREE.BufferAttribute(bt.col, 4, true));
+  g.setIndex(new THREE.BufferAttribute(bt.idx, 1));
+  g.boundingBox = new THREE.Box3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(65535, 65535, 65535));
+  g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+  const mesh = new THREE.Mesh(g, bt.transparent ? matTrans : matOpaque);
+  mesh.position.set(bt.tmin[0], bt.tmin[1], bt.tmin[2]); mesh.scale.set(bt.sc[0], bt.sc[1], bt.sc[2]);
+  mesh.matrixAutoUpdate = false; mesh.updateMatrix();
+  return { mesh, ranges: bt.ranges, col: bt.col, orig: null };
 }
 
 function layerTris(t, lod) { return lod === 'f' ? t.meta.t : t.meta.ct; }
@@ -220,11 +173,12 @@ async function loadLayer(t, lod) {
   const L = t.L[lod];
   L.state = 'loading'; if (lod === 'f') inflight++; else inflightC++;
   try {
-    const bytes = lod === 'f' ? await fetchSealed(`${t.meta.u || 'data/tiles/'}${t.meta.f}`)
-      : t.meta.cl ? await openSealed((await bundle(t.meta.cb)).subarray(t.meta.co, t.meta.co + t.meta.cl))
-      : await fetchSealed(`data/tiles/${t.meta.c}`);
+    const box = [t.box.min.x, t.box.min.y, t.box.min.z, t.box.max.x, t.box.max.y, t.box.max.z];
+    const res = lod === 'f' ? await workerCall({ url: `${t.meta.u || 'data/tiles/'}${t.meta.f}`, box })
+      : t.meta.cl ? await workerCall({ bundle: true, url: `data/tiles/${index.coarseBundles[t.meta.cb]}`, off: t.meta.co, len: t.meta.cl, box })
+      : await workerCall({ url: `data/tiles/${t.meta.c}`, box });
     if (L.state !== 'loading') return;             // cancelled meanwhile
-    L.batches = parseTile(bytes, t.box);
+    L.batches = res.map(batchMesh);
     L.group = new THREE.Group();
     for (const b of L.batches) L.group.add(b.mesh);
     modelRoot.add(L.group);
@@ -278,6 +232,7 @@ function schedule() {
     budget += t.meta.t; keep.add(t);
   }
   for (const t of tiles) if (t.L.f.state !== 'idle' && t.L.f.state !== 'error' && !keep.has(t)) unloadLayer(t, 'f');
+  if (interacting) { updateStatus(); return; }   // resume when the gesture ends
   for (const t of order) {                       // coarse first, nearest first
     if (inflightC >= MAX_COARSE) break;
     if (hasCoarse(t) && t.L.c.state === 'idle') loadLayer(t, 'c');
@@ -495,6 +450,31 @@ function namedFor(itemId) {
   return best;
 }
 
+// Zoom speed follows the distance of whatever is under the cursor / pinch centre: at the start of a
+// zoom gesture the orbit pivot is moved onto the view axis at that depth (the camera does not turn),
+// so pinching towards far equipment covers ground quickly and near equipment slows down.
+let lastRetarget = 0;
+function retargetAt(clientX, clientY) {
+  const now = performance.now();
+  if (now - lastRetarget < 250 || anim) return;
+  lastRetarget = now;
+  const hit = pick(clientX, clientY);
+  if (!hit) return;
+  const fwd = camera.getWorldDirection(new THREE.Vector3());
+  const depth = hit.point.clone().sub(camera.position).dot(fwd);
+  if (!(depth > 0)) return;
+  controls.target.copy(camera.position).addScaledVector(fwd, Math.max(depth, PUSH_MIN * 1.5));
+  lastDist = null;
+}
+canvas.addEventListener('wheel', e => retargetAt(e.clientX, e.clientY), { passive: true });
+const touchPts = new Map();
+canvas.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'touch') return;
+  touchPts.set(e.pointerId, [e.clientX, e.clientY]);
+  if (touchPts.size === 2) { const [a, b] = [...touchPts.values()]; lastRetarget = 0; retargetAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2); }
+});
+for (const ev of ['pointerup', 'pointercancel']) canvas.addEventListener(ev, e => touchPts.delete(e.pointerId));
+
 let downAt = null, lastTap = 0;
 canvas.addEventListener('pointerdown', e => { downAt = { x: e.clientX, y: e.clientY, t: performance.now() }; });
 canvas.addEventListener('pointerup', e => {
@@ -643,6 +623,7 @@ async function unlock(pass, remember) {
     try { bytes = await fetchSealed('data/index.bin'); }
     catch (e) { if (e.name === 'OperationError') throw new Error('密鑰錯誤'); throw e; }
     index = JSON.parse(new TextDecoder().decode(bytes));
+    startWorkers();
     try { if (remember) localStorage.setItem(REMEMBER_KEY, pass); else localStorage.removeItem(REMEMBER_KEY); } catch { }
     start();
   } catch (e) {
